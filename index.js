@@ -72,7 +72,7 @@ module.exports = async function (context) {
             .find({ IsConverted: true }, 'MasterLabel')
             .limit(1);
 
-    // 3.4  Convert each lead (sequential for sandbox simplicity)
+    // 3.4  Convert each lead 
     for (const lead of leads) {
         try {
             const [result] = await soap.convertLead([{
