@@ -1,83 +1,109 @@
+const { Connection, SoapApi } = require('jsforce');
 const sql = require('mssql');
-const jsforce = require('jsforce');
-require('dotenv').config();
 
-// Azure Function entry point
-module.exports = async function (context, req) {
-    context.log('Lead Conversion Azure Function started.');
+/* ───────────── 1.  Configuration ───────────── */
 
-    // Salesforce connection setup
-    const sfConn = new jsforce.Connection({ loginUrl: process.env.SF_LOGIN_URL });
+const CONFIG = Object.freeze({
+    SF_LOGIN_URL: process.env.SF_LOGIN_URL,
+    SF_USERNAME: process.env.SF_USERNAME,
+    SF_PASSWORD: process.env.SF_PASSWORD,
+    SF_TOKEN: process.env.SF_TOKEN,
+    DB_CONN_STR: process.env.DB_CONN_STR
+});
 
-    // SQL Server configuration
-    const sqlConfig = {
-        user: process.env.SQL_USER,
-        password: process.env.SQL_PASSWORD,
-        server: process.env.SQL_SERVER,
-        database: process.env.SQL_DATABASE,
-        options: { encrypt: true }
-    };
+// Fail fast if any env-var is missing
+const missing = Object.entries(CONFIG)
+    .filter(([, value]) => !value)
+    .map(([key]) => key);
+if (missing.length) {
+    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
+}
 
-    try {
-        // Connect to SQL Server
-        await sql.connect(sqlConfig);
-        context.log('Connected to SQL Server.');
+// Re-use one SQL pool across invocations (Azure Functions best practice)
+const sqlPool = sql.connect(CONFIG.DB_CONN_STR);
 
-        // Fetch leads pending conversion
-        const pendingLeadsResult = await sql.query`
-      SELECT SF_LeadId, SecureSite_ClientId__c, Created_Date 
-      FROM JOBS.SF_Leads_Pending_Conversion
-    `;
+/* ───────────── 2.  Helper functions ───────────── */
 
-        const pendingLeads = pendingLeadsResult.recordset;
+/** Insert a row into JOBS.SF_Leads_Conversion_Errors */
+async function logError(pool, lead, message) {
+    await pool.request()
+        .input('leadId', sql.Char(18), lead.SF_LeadId)
+        .input('client', sql.VarChar(50), lead.SecureSite_ClientId__c)
+        .input('created', sql.DateTime2, lead.Created_Date)
+        .input('errDate', sql.DateTime2, new Date())
+        .input('msg', sql.NVarChar(sql.MAX), message)
+        .query(`
+      INSERT INTO JOBS.SF_Leads_Conversion_Errors
+             (SF_LeadId, SecureSite_ClientId__c,
+              Created_Date, Error_Date, Error_Message)
+      VALUES (@leadId, @client, @created, @errDate, @msg)
+    `);
+}
 
-        if (pendingLeads.length === 0) {
-            context.log('No leads pending conversion.');
-            return;
-        }
+/* ───────────── 3.  Azure Function entry point ───────────── */
 
-        // Authenticate with Salesforce
-        await sfConn.login(process.env.SF_USERNAME, process.env.SF_PASSWORD);
-        context.log('Authenticated with Salesforce.');
+module.exports = async function (context) {
 
-        for (const lead of pendingLeads) {
-            try {
-                context.log(`Converting lead: ${lead.SF_LeadId}`);
+    // 3.1  Connect to SQL and Salesforce
+    const pool = await sqlPool;
 
-                // Call Salesforce API to convert Lead
-                const conversionResult = await sfConn.soap.convertLead({
-                    leadId: lead.SF_LeadId,
-                    convertedStatus: 'Closed - Converted'  // Adjust this based on the SF setup
-                });
+    const sf = new Connection({ loginUrl: CONFIG.SF_LOGIN_URL });
+    await sf.login(
+        CONFIG.SF_USERNAME,
+        CONFIG.SF_PASSWORD + CONFIG.SF_TOKEN          // username-password-token pattern
+    );
+    const soap = new SoapApi(sf);
 
-                if (conversionResult.success) {
-                    context.log(`Lead converted successfully: AccountId: ${conversionResult.accountId}, ContactId: ${conversionResult.contactId}`);
+    // 3.2  Read the queue
+    const { recordset: leads } = await pool.request().query(`
+    SELECT SF_LeadId, SecureSite_ClientId__c, Created_Date
+    FROM   JOBS.SF_Leads_Pending_Conversion
+  `);
 
-                    // Delete converted lead from pending table
-                    await sql.query`
-            DELETE FROM JOBS.SF_Leads_Pending_Conversion 
-            WHERE SF_LeadId = ${lead.SF_LeadId}
-          `;
-
-                    // TODO: Proceed with creating Opportunity (DCI-7)
-                } else {
-                    throw new Error(conversionResult.errors.join('; '));
-                }
-            } catch (err) {
-                context.log.error(`Error converting lead ${lead.SF_LeadId}: ${err.message}`);
-
-                // Insert error details into error table
-                await sql.query`
-          INSERT INTO JOBS.SF_Leads_Conversion_Errors (SF_LeadId, SecureSite_ClientId__c, Created_Date, Error_Message)
-          VALUES (${lead.SF_LeadId}, ${lead.SecureSite_ClientId__c}, ${lead.Created_Date}, ${err.message})
-        `;
-            }
-        }
-
-    } catch (globalErr) {
-        context.log.error(`General error in function: ${globalErr.message}`);
-    } finally {
-        sql.close();
-        context.log('Lead Conversion Azure Function completed.');
+    if (leads.length === 0) {
+        context.log('No pending leads.');
+        await sf.logout();
+        return;
     }
+
+    // 3.3  Find the org-specific converted status once
+    const [{ MasterLabel: convertedStatus = 'Closed - Converted' }] =
+        await sf.sobject('LeadStatus')
+            .find({ IsConverted: true }, 'MasterLabel')
+            .limit(1);
+
+    // 3.4  Convert each lead (sequential for sandbox simplicity)
+    for (const lead of leads) {
+        try {
+            const [result] = await soap.convertLead([{
+                leadId: lead.SF_LeadId,
+                convertedStatus,
+                doNotCreateOpportunity: false
+            }]);
+
+            if (result.success) {
+                // Success: write IDs to log, then dequeue
+                context.log(
+                    `Converted Lead ${lead.SF_LeadId} → ` +
+                    `Account ${result.accountId}, Contact ${result.contactId}, ` +
+                    `Opportunity ${result.opportunityId || 'none'}`
+                );
+
+                await pool.request()
+                    .input('leadId', sql.Char(18), lead.SF_LeadId)
+                    .query(`
+            DELETE FROM JOBS.SF_Leads_Pending_Conversion
+            WHERE  SF_LeadId = @leadId
+          `);
+
+            } else {
+                await logError(pool, lead, result.errors.map(e => e.message).join('; '));
+            }
+
+        } catch (err) {
+            await logError(pool, lead, err.message);
+        }
+    }
+
+    await sf.logout();
 };
