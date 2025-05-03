@@ -1,3 +1,8 @@
+#KEY_VAULT_URL
+#SQL_SERVER_URL
+#SQL_DATABASE_NAME
+#CREATE ENV VARIABLES FOR ABOVE
+
 import logging
 import azure.functions as func
 import pyodbc
